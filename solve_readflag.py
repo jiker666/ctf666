@@ -203,18 +203,26 @@ def try_read_paths(paths: list[str]) -> str | None:
 
 
 def scan_for_flag_files() -> str | None:
-    bases = ["/", "/root", "/home", "/app", "/data", "/workspace", "/tmp"]
+    bases = ["/root", "/home", "/app", "/data", "/workspace", "/tmp"]
     max_depth = 2
     max_size = 8192
+    max_files = 500
+    start = time.time()
+    checked = 0
     for base in bases:
         if not os.path.isdir(base):
             continue
         base_depth = base.rstrip(os.sep).count(os.sep)
         for root, dirs, files in os.walk(base):
+            if time.time() - start > 5.0:
+                return None
             depth = root.count(os.sep) - base_depth
             if depth >= max_depth:
                 dirs[:] = []
             for name in files:
+                checked += 1
+                if checked > max_files:
+                    return None
                 if "flag" not in name.lower():
                     continue
                 path = os.path.join(root, name)
