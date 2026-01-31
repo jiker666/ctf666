@@ -250,6 +250,34 @@ def scan_binary_for_flag(paths: list[str]) -> str | None:
     return None
 
 
+def extract_strings(data: bytes, min_len: int = 6) -> list[str]:
+    out: list[str] = []
+    buf: list[str] = []
+    for b in data:
+        if 32 <= b < 127:
+            buf.append(chr(b))
+        else:
+            if len(buf) >= min_len:
+                out.append("".join(buf))
+            buf = []
+    if len(buf) >= min_len:
+        out.append("".join(buf))
+    return out
+
+
+def binary_hints(paths: list[str]) -> list[str]:
+    hints: list[str] = []
+    for path in paths:
+        try:
+            data = Path(path).read_bytes()
+        except Exception:
+            continue
+        for s in extract_strings(data, min_len=6):
+            if "flag" in s.lower():
+                hints.append(s)
+    return hints[:10]
+
+
 def main() -> int:
     outputs: list[bytes] = []
     fd3_outputs: list[bytes] = []
@@ -310,6 +338,18 @@ def main() -> int:
     if flag:
         print(f"FLAG: {flag}", flush=True)
         return 0
+
+    hints = binary_hints(["/readflag", "/bin/readflag"])
+    if hints:
+        print("BINARY_HINTS_BEGIN", flush=True)
+        for hint in hints:
+            print(hint, flush=True)
+            if hint.startswith("/") and "flag" in hint.lower():
+                extra = try_read_paths([hint])
+                if extra:
+                    print(f"FLAG: {extra}", flush=True)
+                    return 0
+        print("BINARY_HINTS_END", flush=True)
 
     if errors:
         print("ERRORS: " + " | ".join(errors), flush=True)
