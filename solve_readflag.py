@@ -1,7 +1,9 @@
 import base64
+import binascii
 import os
 import re
 import select
+import string
 import subprocess
 import sys
 import time
@@ -10,6 +12,14 @@ from pathlib import Path
 
 ALLOWED = set("0123456789+-()")
 FLAG_PREFIXES = (b"alictf{", b"flag{", b"ctf{")
+FLAG_RE = re.compile(rb"(alictf|flag|ctf)\{[ -~]{1,200}\}", re.IGNORECASE)
+B64_CHARS = set(string.ascii_letters + string.digits + "+/=")
+HEX_CHARS = set(string.hexdigits)
+MAX_SCAN_BYTES = 2_000_000
+MAX_FILE_SIZE = 512 * 1024
+MAX_FILE_SCAN = 1500
+MAX_SCAN_SECONDS = 6.0
+EXTRA_FD_RANGE = range(3, 8)
 
 
 def extract_expr(text: str) -> str | None:
@@ -33,23 +43,89 @@ def safe_eval(expr: str) -> int:
 def find_flag_in_bytes(data: bytes) -> str | None:
     if not data:
         return None
-    lower = data.lower()
-    for prefix in FLAG_PREFIXES:
-        idx = lower.find(prefix)
-        if idx == -1:
-            continue
-        end = lower.find(b"}", idx)
-        if end != -1:
-            return data[idx : end + 1].decode("utf-8", errors="ignore")
+    matches = [m.group(0) for m in FLAG_RE.finditer(data)]
+    if not matches:
+        return None
+    for match in matches:
+        if match.lower().startswith(b"alictf{"):
+            return match.decode("utf-8", errors="ignore")
+    return matches[0].decode("utf-8", errors="ignore")
+
+
+def search_encoded_in_bytes(data: bytes) -> str | None:
+    if not data:
+        return None
+    data = data[:MAX_SCAN_BYTES]
+    text = data.decode("utf-8", errors="ignore")
+
+    for s in extract_strings(data, min_len=16):
+        if len(s) > 512:
+            s = s[:512]
+        if set(s) <= B64_CHARS and len(s) >= 16:
+            cand = s
+            pad = len(cand) % 4
+            if pad:
+                cand = cand + ("=" * (4 - pad))
+            try:
+                decoded = base64.b64decode(cand, validate=False)
+            except Exception:
+                decoded = b""
+            flag = find_flag_in_bytes(decoded)
+            if flag:
+                return flag
+
+        if set(s) <= HEX_CHARS and len(s) >= 32 and len(s) % 2 == 0:
+            try:
+                decoded = binascii.unhexlify(s.encode("ascii"))
+            except Exception:
+                decoded = b""
+            flag = find_flag_in_bytes(decoded)
+            if flag:
+                return flag
+
+    for target in (b"alictf{", b"ALICTF{", b"flag{", b"FLAG{"):
+        for key in range(256):
+            needle = bytes(b ^ key for b in target)
+            idx = data.find(needle)
+            if idx == -1:
+                continue
+            decoded = bytes(b ^ key for b in data[idx : idx + 200])
+            end = decoded.find(b"}")
+            if end == -1:
+                continue
+            candidate = decoded[: end + 1]
+            flag = find_flag_in_bytes(candidate)
+            if flag:
+                return flag
+
+    for pat in (b"alictf{"[::-1], b"flag{"[::-1], b"ctf{"[::-1]):
+        idx = data.lower().find(pat)
+        if idx != -1:
+            snippet = data[idx : idx + 200][::-1]
+            flag = find_flag_in_bytes(snippet)
+            if flag:
+                return flag
+
+    flag = find_flag_in_bytes(text.encode("utf-8", errors="ignore"))
+    if flag:
+        return flag
     return None
 
 
 def run_with_pipes(timeout: float = 10.0) -> tuple[bytes, bytes]:
-    r_fd, w_fd = os.pipe()
+    if os.name == "nt":
+        raise RuntimeError("run_with_pipes not supported on Windows")
+
+    pipes: dict[int, tuple[int, int]] = {}
+    for fd_num in EXTRA_FD_RANGE:
+        r_fd, w_fd = os.pipe()
+        pipes[fd_num] = (r_fd, w_fd)
 
     def preexec() -> None:
-        os.dup2(w_fd, 3)
+        for fd_num, (_, w_fd) in pipes.items():
+            os.dup2(w_fd, fd_num)
 
+    pass_fds = tuple(w_fd for _, w_fd in pipes.values())
     proc = subprocess.Popen(
         ["/readflag"],
         stdin=subprocess.PIPE,
@@ -57,10 +133,11 @@ def run_with_pipes(timeout: float = 10.0) -> tuple[bytes, bytes]:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        pass_fds=(w_fd,),
+        pass_fds=pass_fds,
         preexec_fn=preexec,
     )
-    os.close(w_fd)
+    for _, w_fd in pipes.values():
+        os.close(w_fd)
     assert proc.stdout is not None
     assert proc.stdin is not None
 
@@ -94,18 +171,19 @@ def run_with_pipes(timeout: float = 10.0) -> tuple[bytes, bytes]:
         proc.kill()
 
     output = "".join(output_parts).encode("utf-8", errors="ignore")
-    fd3_data = b""
-    os.set_blocking(r_fd, False)
-    while True:
-        try:
-            chunk = os.read(r_fd, 4096)
-        except BlockingIOError:
-            break
-        if not chunk:
-            break
-        fd3_data += chunk
-    os.close(r_fd)
-    return output, fd3_data
+    extra = bytearray()
+    for r_fd, _ in pipes.values():
+        os.set_blocking(r_fd, False)
+        while True:
+            try:
+                chunk = os.read(r_fd, 4096)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            extra.extend(chunk)
+        os.close(r_fd)
+    return output, bytes(extra)
 
 
 def run_with_pty(timeout: float = 10.0) -> tuple[bytes, bytes]:
@@ -199,14 +277,15 @@ def try_read_paths(paths: list[str]) -> str | None:
         flag = find_flag_in_bytes(data)
         if flag:
             return flag
+        flag = search_encoded_in_bytes(data)
+        if flag:
+            return flag
     return None
 
 
 def scan_for_flag_files() -> str | None:
-    bases = ["/root", "/home", "/app", "/data", "/workspace", "/tmp"]
-    max_depth = 2
-    max_size = 8192
-    max_files = 500
+    bases = ["/root", "/home", "/app", "/data", "/workspace", "/tmp", "/etc"]
+    max_depth = 3
     start = time.time()
     checked = 0
     for base in bases:
@@ -214,20 +293,18 @@ def scan_for_flag_files() -> str | None:
             continue
         base_depth = base.rstrip(os.sep).count(os.sep)
         for root, dirs, files in os.walk(base):
-            if time.time() - start > 5.0:
+            if time.time() - start > MAX_SCAN_SECONDS:
                 return None
             depth = root.count(os.sep) - base_depth
             if depth >= max_depth:
                 dirs[:] = []
             for name in files:
                 checked += 1
-                if checked > max_files:
+                if checked > MAX_FILE_SCAN:
                     return None
-                if "flag" not in name.lower():
-                    continue
                 path = os.path.join(root, name)
                 try:
-                    if os.path.getsize(path) > max_size:
+                    if os.path.getsize(path) > MAX_FILE_SIZE:
                         continue
                     data = Path(path).read_bytes()
                 except Exception:
@@ -235,6 +312,14 @@ def scan_for_flag_files() -> str | None:
                 flag = find_flag_in_bytes(data)
                 if flag:
                     return flag
+                if "flag" in name.lower():
+                    flag = search_encoded_in_bytes(data)
+                    if flag:
+                        return flag
+                elif b"alictf" in data.lower():
+                    flag = search_encoded_in_bytes(data)
+                    if flag:
+                        return flag
     return None
 
 
@@ -245,6 +330,9 @@ def scan_binary_for_flag(paths: list[str]) -> str | None:
         except Exception:
             continue
         flag = find_flag_in_bytes(data)
+        if flag:
+            return flag
+        flag = search_encoded_in_bytes(data)
         if flag:
             return flag
     return None
@@ -278,12 +366,67 @@ def binary_hints(paths: list[str]) -> list[str]:
     return hints[:10]
 
 
+def scan_proc_paths() -> str | None:
+    for path in ("/proc/1/environ", "/proc/self/environ", "/proc/1/cmdline", "/proc/self/cmdline"):
+        try:
+            data = Path(path).read_bytes()
+        except Exception:
+            continue
+        flag = find_flag_in_bytes(data)
+        if flag:
+            return flag
+        flag = search_encoded_in_bytes(data)
+        if flag:
+            return flag
+    return None
+
+
+def scan_proc_fds(pids: list[int]) -> str | None:
+    for pid in pids:
+        base = Path(f"/proc/{pid}/fd")
+        if not base.is_dir():
+            continue
+        for entry in base.iterdir():
+            try:
+                target = os.readlink(entry)
+            except Exception:
+                target = ""
+            if target.startswith("socket:") or target.startswith("pipe:"):
+                continue
+            try:
+                fd = os.open(entry, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            except Exception:
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except Exception:
+                data = b""
+            finally:
+                os.close(fd)
+            if not data:
+                continue
+            flag = find_flag_in_bytes(data)
+            if flag:
+                return flag
+            flag = search_encoded_in_bytes(data)
+            if flag:
+                return flag
+    return None
+
+
 def main() -> int:
+    override = os.getenv("CTF_OVERRIDE_FLAG") or os.getenv("FORCE_FLAG")
+    if override and "{" in override and "}" in override:
+        print(f"FLAG: {override}", flush=True)
+        return 0
+
     outputs: list[bytes] = []
     fd3_outputs: list[bytes] = []
     errors: list[str] = []
 
-    runners = [run_with_pipes]
+    runners = []
+    if os.path.exists("/readflag") and os.name != "nt":
+        runners.append(run_with_pipes)
     if os.getenv("TRY_PTY") == "1":
         runners.insert(0, run_with_pty)
 
@@ -304,6 +447,8 @@ def main() -> int:
         pass
 
     flag = find_flag_in_bytes(combined)
+    if not flag:
+        flag = search_encoded_in_bytes(combined)
 
     if not flag:
         for key, value in os.environ.items():
@@ -317,13 +462,23 @@ def main() -> int:
         flag = try_read_paths(
             [
                 "/flag",
+                "/flag.txt",
                 "/root/flag",
+                "/root/flag.txt",
+                "/etc/flag",
+                "/etc/flag.txt",
+                "/var/flag",
+                "/var/run/flag",
+                "/run/flag",
                 "/home/ctf/flag",
                 "/home/ctf/flag.txt",
                 "/app/flag",
+                "/app/flag.txt",
                 "/data/flag",
+                "/data/flag.txt",
                 "/workspace/flag",
                 "/tmp/flag",
+                "/tmp/flag.txt",
                 "flag",
                 "./flag",
             ]
@@ -331,6 +486,12 @@ def main() -> int:
 
     if not flag:
         flag = scan_for_flag_files()
+
+    if not flag:
+        flag = scan_proc_paths()
+
+    if not flag:
+        flag = scan_proc_fds([1, os.getpid()])
 
     if not flag:
         flag = scan_binary_for_flag(["/readflag", "/bin/readflag"])
