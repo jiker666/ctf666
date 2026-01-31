@@ -230,12 +230,28 @@ def scan_for_flag_files() -> str | None:
     return None
 
 
+def scan_binary_for_flag(paths: list[str]) -> str | None:
+    for path in paths:
+        try:
+            data = Path(path).read_bytes()
+        except Exception:
+            continue
+        flag = find_flag_in_bytes(data)
+        if flag:
+            return flag
+    return None
+
+
 def main() -> int:
     outputs: list[bytes] = []
     fd3_outputs: list[bytes] = []
     errors: list[str] = []
 
-    for runner in (run_with_pty, run_with_pipes):
+    runners = [run_with_pipes]
+    if os.getenv("TRY_PTY") == "1":
+        runners.insert(0, run_with_pty)
+
+    for runner in runners:
         try:
             out, fd3 = runner()
             outputs.append(out)
@@ -279,6 +295,9 @@ def main() -> int:
 
     if not flag:
         flag = scan_for_flag_files()
+
+    if not flag:
+        flag = scan_binary_for_flag(["/readflag", "/bin/readflag"])
 
     if flag:
         print(f"FLAG: {flag}", flush=True)
