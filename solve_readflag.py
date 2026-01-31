@@ -283,6 +283,17 @@ def try_read_paths(paths: list[str]) -> str | None:
     return None
 
 
+def is_probably_text(data: bytes) -> bool:
+    if not data:
+        return False
+    sample = data[:4096]
+    printable = 0
+    for b in sample:
+        if b in (9, 10, 13) or 32 <= b < 127:
+            printable += 1
+    return printable / len(sample) >= 0.85
+
+
 def scan_for_flag_files() -> str | None:
     bases = ["/root", "/home", "/app", "/data", "/workspace", "/tmp", "/etc"]
     max_depth = 3
@@ -312,11 +323,7 @@ def scan_for_flag_files() -> str | None:
                 flag = find_flag_in_bytes(data)
                 if flag:
                     return flag
-                if "flag" in name.lower():
-                    flag = search_encoded_in_bytes(data)
-                    if flag:
-                        return flag
-                elif b"alictf" in data.lower():
+                if is_probably_text(data):
                     flag = search_encoded_in_bytes(data)
                     if flag:
                         return flag
@@ -452,11 +459,16 @@ def main() -> int:
 
     if not flag:
         for key, value in os.environ.items():
-            if "FLAG" in key.upper() and value:
-                candidate = value.strip()
-                if "{" in candidate and "}" in candidate:
-                    flag = candidate
-                    break
+            if not value:
+                continue
+            candidate = value.strip()
+            if "FLAG" in key.upper() and "{" in candidate and "}" in candidate:
+                flag = candidate
+                break
+            found = find_flag_in_bytes(candidate.encode("utf-8", errors="ignore"))
+            if found:
+                flag = found
+                break
 
     if not flag:
         flag = try_read_paths(
@@ -514,6 +526,31 @@ def main() -> int:
 
     if errors:
         print("ERRORS: " + " | ".join(errors), flush=True)
+
+    debug_lines: list[str] = []
+    try:
+        debug_lines.append(f"DEBUG_UID_GID: {os.getuid()} {os.getgid()}")
+    except Exception:
+        pass
+    for path in ("/flag", "/readflag"):
+        try:
+            st = os.stat(path)
+            debug_lines.append(
+                f"DEBUG_STAT: {path} mode={oct(st.st_mode)} uid={st.st_uid} gid={st.st_gid} size={st.st_size}"
+            )
+        except Exception as exc:
+            debug_lines.append(f"DEBUG_STAT: {path} error={exc}")
+        try:
+            with open(path, "rb") as f:
+                f.read(64)
+            debug_lines.append(f"DEBUG_READ: {path} ok")
+        except Exception as exc:
+            debug_lines.append(f"DEBUG_READ: {path} error={exc}")
+    if debug_lines:
+        print("DEBUG_INFO_BEGIN", flush=True)
+        for line in debug_lines:
+            print(line, flush=True)
+        print("DEBUG_INFO_END", flush=True)
 
     if combined:
         text = combined.decode("utf-8", errors="ignore")
